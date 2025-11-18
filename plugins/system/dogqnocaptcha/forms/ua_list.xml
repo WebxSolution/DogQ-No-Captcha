@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<form>
+    <fields name="ua">
+        <fieldset name="ua">
+            <field
+                name="useragent"
+                type="text"
+                label="User Agent"
+                description="Enter a DogQ user-agent string to allow."
+                required="true"
+            />
+        </fieldset>
+    </fields>
+</form>
