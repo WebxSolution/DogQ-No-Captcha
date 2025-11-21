@@ -4,107 +4,250 @@ namespace Joomla\Plugin\System\Dogqnocaptcha\Extension;
 
 use Joomla\CMS\Plugin\CMSPlugin;
 use Joomla\CMS\Factory;
+use Joomla\CMS\Document\HtmlDocument as JDocumentHtml;
+use Joomla\Database\ParameterType;
 
 defined('_JEXEC') or die;
 
 class Dogqnocaptcha extends CMSPlugin
 {
-    public function onBeforeCompileHead()
+    protected string $tokenReceived = '';
+    protected string $tokenExpected = '';
+    protected bool   $tokenReady    = false;
+    protected string $paramName     = 'xf3p';
+    protected bool   $checkUa       = false;
+
+    /** @var bool Internally track whether we disabled RSFormPro's Recaptcha field */
+    protected bool $recaptchaDisabled = false;
+
+    /**
+     * onAfterRoute – compute tokens, check UA, and temporarily unpublish RSFormPro Recaptcha field
+     */
+    public function onAfterRoute(): void
     {
-        $this->removeRecaptchaJs();
-    }
+        $app = $this->getApplication();
+        $this->computeTokens();
 
-    public function onRsformFrontendBeforeShowForm($formId, &$form)
-    {
-        $this->removeCaptchaComponents($form);
-    }
-
-    protected function removeRecaptchaJs(): void
-    {
-        $input = Factory::getApplication()->input;
-        $agent = $input->server->getString('HTTP_USER_AGENT', '');
-        $flowReceived = $input->getString('flow_id', '');
-        $flowExpected = $this->params->get('flow_id', '');
-
-        if ($flowExpected && $flowReceived === $flowExpected) {
-
-            $patterns = [];
-            $uaList = $this->params->get('ua_list', []);
-            if (is_array($uaList)) {
-                foreach ($uaList as $item) {
-                    if (!empty($item['useragent'])) {
-                        $patterns[] = trim($item['useragent']);
-                    }
-                }
+        // Collect UA patterns
+        $uaList  = (array) $this->params->get('ua_list', []);
+        $patterns = [];
+        foreach ($uaList as $uaRow) {
+            if (!empty($uaRow->useragent)) {
+                $patterns[] = trim($uaRow->useragent);
             }
+        }
 
-            // If UA list is empty, skip pattern check (flow_id alone is enough)
-            $checkUa = empty($patterns) || false;
+        $agent   = $app->input->server->getString('HTTP_USER_AGENT', '');
+        $checkUa = empty($patterns); // if no patterns, skip UA check
+
+        if (!$checkUa) {
             foreach ($patterns as $pattern) {
                 if ($pattern && stripos($agent, $pattern) !== false) {
                     $checkUa = true;
                     break;
                 }
             }
+        }
 
-            if ($checkUa) {
-                $doc = Factory::getApplication()->getDocument();
+        // Apply final decision
+        $this->checkUa = $checkUa;
 
-                if ($doc instanceof \JDocumentHtml) {
-                    $headData = $doc->getHeadData();
+        // --- IMPORTANT ---
+        // If UA is allowed AND token matches, we disable the RSFormPro Recaptcha field in DB.
+        // This prevents RSFormPro from validating recaptcha on form submit.
+        // We'll restore (republish) it in onAfterRender.
+        $formId = $app->input->getInt('formId', 0);
+		$option = $app->input->get('option',''); 
+        if ($option == 'com_rsform' && $formId > 0 && $this->tokenReceived === $this->tokenExpected && $this->checkUa) {
+            $this->disableRecaptchaField($formId);
+            $this->recaptchaDisabled = true;
+        }
+		else if($option == 'com_rsform' && $formId > 0)
+		{			
+			$this->enableRecaptchaField($formId);
+		}		
+    }
 
-                    if (!empty($headData['scripts'])) {
-                        foreach ($headData['scripts'] as $script => $attrs) {
-                            if (str_contains($script, 'www.google.com/recaptcha') || str_contains($script, 'www.recaptcha.net/recaptcha')) {
-                                unset($headData['scripts'][$script]);
-                            }
+	/**
+     * onBeforeCompileHead – remove Recaptcha JS from head (only if token & UA are valid)
+     */
+    public function onBeforeCompileHead(): void
+    {
+        if (!$this->tokenReady) {
+            $this->computeTokens();
+        }
+
+        if ($this->tokenReceived !== $this->tokenExpected || !$this->checkUa) {
+            return;
+        }
+
+        $doc = Factory::getApplication()->getDocument();
+        if (!($doc instanceof JDocumentHtml)) {
+            return;
+        }
+
+        $headData = $doc->getHeadData();
+
+        // Remove external recaptcha scripts
+        if (!empty($headData['scripts'])) {
+            foreach ($headData['scripts'] as $script => $attrs) {
+                if (
+                    str_contains($script, '/plg_system_rsfprecaptchav3/js/script.js') ||
+                    str_contains($script, 'www.google.com/recaptcha') ||
+                    str_contains($script, 'www.recaptcha.net/recaptcha') ||
+                    str_contains($script, 'www.gstatic.com/recaptcha')
+                ) {
+                    unset($headData['scripts'][$script]);
+                }
+            }
+        }
+
+        // Remove inline Recaptcha snippets
+        if (!empty($headData['script']) && is_array($headData['script'])) {
+            foreach ($headData['script'] as $mime => $scripts) {
+                if (!is_array($scripts)) continue;
+                foreach ($scripts as $hash => $scriptCode) {
+                    if (is_string($scriptCode)) {
+                        if (
+                            str_contains($scriptCode, 'grecaptcha') ||
+                            str_contains($scriptCode, 'recaptcha') ||
+                            str_contains($scriptCode, 'RSFormProReCAPTCHAv3')
+                        ) {
+                            unset($headData['script'][$mime][$hash]);
                         }
-
-                        $doc->setHeadData($headData);
                     }
                 }
+                if (empty($headData['script'][$mime])) {
+                    unset($headData['script'][$mime]);
+                }
+            }
+        }
+
+        $doc->setHeadData($headData);
+    }
+
+	/**
+     * onRsformFrontendInitFormDisplay – remove template placeholders for recaptcha
+     */
+    public function onRsformFrontendInitFormDisplay($args)
+    {
+        if (!empty($args['formLayout']) && is_string($args['formLayout'])) {
+            $args['formLayout'] = preg_replace(
+                '/\{recp?aptcha:[^}]+}/i',
+                '',
+                $args['formLayout']
+            );
+        }
+    }
+
+   
+    /**
+     * Disable RSFormPro Recaptcha field for this form.
+     */
+    protected function disableRecaptchaField(int $formId): void
+    {
+        
+		$db = Factory::getDbo();
+		$query = $db->getQuery(true)
+		->select('ComponentTypeId')
+		->from('#__rsform_component_types')
+		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")');
+		$recaptchaTypes = $db->setQuery($query)->loadColumn();
+		
+
+        foreach ($recaptchaTypes as $type) {
+            $componentIds = \RSFormProHelper::componentExists($formId, $type);
+
+            if (empty($componentIds)) {
+                continue;
+            }
+			
+				
+			
+            foreach ($componentIds as $cid) {
+                // Store original publish state
+				try {
+					$db = Factory::getDbo();
+					$query = $db->getQuery(true)
+						->update($db->quoteName('#__rsform_components'))
+						->set($db->quoteName('published') . ' = 0')
+						->where($db->quoteName('formId') . ' = :formid')
+						->where($db->quoteName('ComponentId') . ' = :cid');
+
+					$query->bind(':formid', $formId, ParameterType::INTEGER);
+					$query->bind(':cid', $cid, ParameterType::STRING);
+
+					$db->setQuery($query)->execute();
+			
+		
+				} catch (\Throwable $e) {
+					// Fail silently; do not break site
+				}
             }
         }
     }
 
-    protected function removeCaptchaComponents(&$form): void
+    /**
+     * Re-enable RSFormPro Recaptcha field for this form.
+     */
+    protected function enableRecaptchaField(int $formId): void
     {
-        $input = Factory::getApplication()->input;
-        $agent = $input->server->getString('HTTP_USER_AGENT', '');
-        $flowReceived = $input->getString('flow_id', '');
-        $flowExpected = $this->params->get('flow_id', '');
+       $db = Factory::getDbo();
+		$query = $db->getQuery(true)
+		->select('ComponentTypeId')
+		->from('#__rsform_component_types')
+		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")');
+		$recaptchaTypes = $db->setQuery($query)->loadColumn();
+		
 
-        if ($flowExpected && $flowReceived === $flowExpected) {
+        foreach ($recaptchaTypes as $type) {
+            $componentIds = \RSFormProHelper::componentExists($formId, $type, 0);
+			
 
-            $patterns = [];
-            $uaList = $this->params->get('ua_list', []);
-            if (is_array($uaList)) {
-                foreach ($uaList as $item) {
-                    if (!empty($item['useragent'])) {
-                        $patterns[] = trim($item['useragent']);
-                    }
-                }
+            if (empty($componentIds)) {
+                continue;
             }
+		
+			
+            foreach ($componentIds as $cid) {
+                // Store original publish state
+				try {
+					$db = Factory::getDbo();
+					$query = $db->getQuery(true)
+						->update($db->quoteName('#__rsform_components'))
+						->set($db->quoteName('published') . ' = 1')
+						->where($db->quoteName('formId') . ' = :formid')
+						->where($db->quoteName('ComponentId') . ' = :cid');
 
-            $checkUa = empty($patterns) || false;
-            foreach ($patterns as $pattern) {
-                if ($pattern && stripos($agent, $pattern) !== false) {
-                    $checkUa = true;
-                    break;
-                }
-            }
+					$query->bind(':formid', $formId, ParameterType::INTEGER);
+					$query->bind(':cid', $cid, ParameterType::STRING);
 
-            if ($checkUa) {
-                if (!empty($form->Components)) {
-                    foreach ($form->Components as $id => $component) {
-                        if (in_array($component->ComponentTypeId, RSFormProHelper::$captchaFields)) {
-                            unset($form->Components[$id]);
-                        }
-                    }
-                }
+					$db->setQuery($query)->execute();
 
-                $form->RemoveCaptchaLogged = true;
+		
+				} catch (\Throwable $e) {
+					// Fail silently; do not break site
+
+
+				}
             }
         }
+    }
+
+
+    /**
+     * Compute tokens from request + plugin params
+     */
+    protected function computeTokens(): void
+    {
+        if ($this->tokenReady) {
+            return;
+        }
+
+        $input = Factory::getApplication()->input;
+        $expectedParam       = $this->params->get($this->paramName, '');
+        $this->tokenReceived = $input->getString($this->paramName, '');
+        $this->tokenExpected = $expectedParam;
+        $this->tokenReady    = true;
     }
 }
