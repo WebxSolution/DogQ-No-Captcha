@@ -57,12 +57,19 @@ class Dogqnocaptcha extends CMSPlugin
         // This prevents RSFormPro from validating recaptcha on form submit.
         // We'll restore (republish) it in onAfterRender.
         $formId = $app->input->getInt('formId', 0);
+
+		// Fallback: If RSForm is embedded in an article ({rsform X})
+		if ($formId == 0) {
+			$formId = $this->detectFormIdFromArticle();
+		}
+		
+		
 		$option = $app->input->get('option',''); 
-        if ($option == 'com_rsform' && $formId > 0 && $this->tokenReceived === $this->tokenExpected && $this->checkUa) {
+        if (in_array($option, ['com_rsform','com_content']) && $formId > 0 && $this->tokenReceived === $this->tokenExpected && $this->checkUa) {
             $this->disableRecaptchaField($formId);
             $this->recaptchaDisabled = true;
         }
-		else if($option == 'com_rsform' && $formId > 0)
+		else if(in_array($option, ['com_rsform','com_content'])  && $formId > 0)
 		{			
 			// Downside: we always re-enable the Rscaptcha field even if it was legitimately
 			// disabled on a form.
@@ -70,7 +77,7 @@ class Dogqnocaptcha extends CMSPlugin
 			// someone could be submitting a real form at the same time,
 			// which could break the submission during our automated test.
 			$this->enableRecaptchaField($formId);
-		}		
+		}
     }
 
 	/**
@@ -149,30 +156,23 @@ class Dogqnocaptcha extends CMSPlugin
     /**
      * Disable RSFormPro Recaptcha field for this form.
      */
-    protected function disableRecaptchaField(int $formId): void
-    {
-        
+	protected function disableRecaptchaField(int $formId): void
+	{
 		$db = Factory::getDbo();
-		$query = $db->getQuery(true)
-		->select('ComponentTypeId')
-		->from('#__rsform_component_types')
-		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")'); //TODO use Joomla paramater Binding for IN clause
-		$recaptchaTypes = $db->setQuery($query)->loadColumn();
-		
 
-        foreach ($recaptchaTypes as $type) {
-            $componentIds = \RSFormProHelper::componentExists($formId, $type);
+		// Always use names, not IDs
+		$typeNames = ['recaptchav3', 'recaptchav2'];
 
-            if (empty($componentIds)) {
-                continue;
-            }
-			
-				
-			
-            foreach ($componentIds as $cid) {
-                // Store original publish state
+		foreach ($typeNames as $typeName) {
+
+			$componentIds = $this->getRsformComponentIds($formId, $typeName, null);
+
+			if (empty($componentIds)) {
+				continue;
+			}
+
+			foreach ($componentIds as $cid) {
 				try {
-					$db = Factory::getDbo();
 					$query = $db->getQuery(true)
 						->update($db->quoteName('#__rsform_components'))
 						->set($db->quoteName('published') . ' = 0')
@@ -180,44 +180,38 @@ class Dogqnocaptcha extends CMSPlugin
 						->where($db->quoteName('ComponentId') . ' = :cid');
 
 					$query->bind(':formid', $formId, ParameterType::INTEGER);
-					$query->bind(':cid', $cid, ParameterType::STRING);
+					$query->bind(':cid', $cid, ParameterType::INTEGER);
 
 					$db->setQuery($query)->execute();
-			
-		
+
 				} catch (\Throwable $e) {
-					// Fail silently; do not break site
+					// silent fail
 				}
-            }
-        }
-    }
+			}
+		}
+	}
+
 
     /**
      * Re-enable RSFormPro Recaptcha field for this form.
      */
-    protected function enableRecaptchaField(int $formId): void
-    {
-       $db = Factory::getDbo();
-		$query = $db->getQuery(true)
-		->select('ComponentTypeId')
-		->from('#__rsform_component_types')
-		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")');
-		$recaptchaTypes = $db->setQuery($query)->loadColumn();
-		
+	protected function enableRecaptchaField(int $formId): void
+	{
+		$db = Factory::getDbo();
 
-        foreach ($recaptchaTypes as $type) {
-            $componentIds = \RSFormProHelper::componentExists($formId, $type, 0);
-			
+		// Use names
+		$typeNames = ['recaptchav3', 'recaptchav2'];
 
-            if (empty($componentIds)) {
-                continue;
-            }
-		
-			
-            foreach ($componentIds as $cid) {
-                // Store original publish state
+		foreach ($typeNames as $typeName) {
+
+			$componentIds = $this->getRsformComponentIds($formId, $typeName, 0);
+
+			if (empty($componentIds)) {
+				continue;
+			}
+
+			foreach ($componentIds as $cid) {
 				try {
-					$db = Factory::getDbo();
 					$query = $db->getQuery(true)
 						->update($db->quoteName('#__rsform_components'))
 						->set($db->quoteName('published') . ' = 1')
@@ -225,19 +219,16 @@ class Dogqnocaptcha extends CMSPlugin
 						->where($db->quoteName('ComponentId') . ' = :cid');
 
 					$query->bind(':formid', $formId, ParameterType::INTEGER);
-					$query->bind(':cid', $cid, ParameterType::STRING);
+					$query->bind(':cid', $cid, ParameterType::INTEGER);
 
 					$db->setQuery($query)->execute();
 
-		
 				} catch (\Throwable $e) {
-					// Fail silently; do not break site
-
-
+					// silent fail
 				}
-            }
-        }
-    }
+			}
+		}
+	}
 
 
     /**
@@ -255,4 +246,98 @@ class Dogqnocaptcha extends CMSPlugin
         $this->tokenExpected = $expectedParam;
         $this->tokenReady    = true;
     }
+	
+	
+	/**
+	 * Fallback: Extract RSForm ID from article content (introtext + fulltext)
+	 */
+	protected function detectFormIdFromArticle(): int
+	{
+		$app = Factory::getApplication();
+		$option = $app->input->getCmd('option', '');
+		$view   = $app->input->getCmd('view', '');
+		$id     = $app->input->getInt('id', 0);
+
+		// We only handle com_content articles
+		if ($option !== 'com_content' || $view !== 'article' || $id <= 0) {
+			return 0;
+		}
+
+		try {
+			$db = Factory::getDbo();
+			$query = $db->getQuery(true)
+				->select($db->quoteName(['introtext','fulltext']))
+				->from($db->quoteName('#__content'))
+				->where($db->quoteName('id') . ' = :id');
+			$query->bind(':id', $id, ParameterType::INTEGER);
+
+			$article = $db->setQuery($query)->loadObject();
+
+			if (!$article) {
+				return 0;
+			}
+
+			$text = $article->introtext . "\n" . $article->fulltext;
+
+			// Works for: {rsform 3} OR {rsform 12} etc.
+			if (preg_match('/\{rsform\s+(\d+)\}/i', $text, $m)) {
+				return (int) $m[1];
+			}
+		}
+		catch (\Throwable $e) {
+			// Silent fail
+		}
+
+		return 0;
+	}
+	
+	/**
+	 * Returns an array of ComponentId values for components of a given type on a form.
+	 *
+	 * @param  int    $formId
+	 * @param  string $typeName  e.g. "recaptchav3" or "recaptchav2"
+	 * @param  int|null $published (1, 0, null) — null = ignore publish state
+	 * @return int[]
+	 */
+	protected function getRsformComponentIds(int $formId, string $typeName, ?int $published = null): array
+	{
+		try {
+			$db = \Joomla\CMS\Factory::getDbo();
+
+			// FIRST: Get the ComponentTypeId for the component type name
+			$query = $db->getQuery(true)
+				->select($db->quoteName('ComponentTypeId'))
+				->from($db->quoteName('#__rsform_component_types'))
+				->where($db->quoteName('ComponentTypeName') . ' = :ctype');
+
+			$query->bind(':ctype', $typeName, \Joomla\Database\ParameterType::STRING);
+
+			$typeId = $db->setQuery($query)->loadResult();
+
+			if (!$typeId) {
+				return [];
+			}
+
+			// SECOND: Find components belonging to this form
+			$query = $db->getQuery(true)
+				->select($db->quoteName('ComponentId'))
+				->from($db->quoteName('#__rsform_components'))
+				->where($db->quoteName('formId') . ' = :fid')
+				->where($db->quoteName('ComponentTypeId') . ' = :tid');
+
+			$query->bind(':fid', $formId, \Joomla\Database\ParameterType::INTEGER);
+			$query->bind(':tid', $typeId, \Joomla\Database\ParameterType::INTEGER);
+
+			if ($published !== null) {
+				$query->where($db->quoteName('published') . ' = :pub');
+				$query->bind(':pub', $published, \Joomla\Database\ParameterType::INTEGER);
+			}
+
+			return $db->setQuery($query)->loadColumn() ?: [];
+		}
+		catch (\Throwable $e) {
+			return [];
+		}
+	}	
+	
 }
