@@ -64,6 +64,11 @@ class Dogqnocaptcha extends CMSPlugin
         }
 		else if($option == 'com_rsform' && $formId > 0)
 		{			
+			// Downside: we always re-enable the Rscaptcha field even if it was legitimately
+			// disabled on a form.
+			// There is also a small possibility that while the DogQ test is running,
+			// someone could be submitting a real form at the same time,
+			// which could break the submission during our automated test.
 			$this->enableRecaptchaField($formId);
 		}		
     }
@@ -133,7 +138,7 @@ class Dogqnocaptcha extends CMSPlugin
     {
         if (!empty($args['formLayout']) && is_string($args['formLayout'])) {
             $args['formLayout'] = preg_replace(
-                '/\{recp?aptcha:[^}]+}/i',
+                '/\{recp?aptcha:[^}]+}/i', //Have to account for recaptcha Typo in RSform plugin hence the [p?]
                 '',
                 $args['formLayout']
             );
@@ -151,7 +156,7 @@ class Dogqnocaptcha extends CMSPlugin
 		$query = $db->getQuery(true)
 		->select('ComponentTypeId')
 		->from('#__rsform_component_types')
-		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")');
+		->where($db->quoteName('ComponentTypeName') . ' IN ("recaptchav3", "recaptchav2")'); //TODO use Joomla paramater Binding for IN clause
 		$recaptchaTypes = $db->setQuery($query)->loadColumn();
 		
 

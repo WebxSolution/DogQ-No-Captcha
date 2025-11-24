@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<extension type="plugin" group="system" method="upgrade" plugin="dogqnocaptcha" version="5.0">
+<extension type="plugin" group="system" method="upgrade" plugin="dogqnocaptcha" version="6.0">
 
     <name>System - DogQ No Captcha</name>
     <version>1.1.0</version>
     <creationDate>2025-11-17</creationDate>
-    <author>Andrew</author>
+    <author>webx.solutions</author>
     <description>Bypass RSForm reCAPTCHA for DogQ testing scripts.</description>
 
     <namespace path="src">Joomla\Plugin\System\Dogqnocaptcha</namespace>
@@ -17,21 +17,28 @@
     </files>
 
     <config>
-        <fieldset name="basic">
-            <field
-                name="ua_list"
-                type="subform"
-                label="Allowed User Agents"
-                description="Add user-agent strings for DogQ scripts."
-                formsource="forms/ua_list.xml"
-                multiple="true"
-            />
-            <field
-                name="flow_id"
-                type="text"
-                label="Flow ID"
-                description="DogQ will submit this value using a hidden field named flow_id."
-            />
-        </fieldset>
+			<fields name="params">
+					<fieldset name="basic" label="Settings">
+
+							<field
+									name="ua_list"
+									type="subform"
+									label="User-Agent Rules"
+									description="Optional patterns DogQ automation may use."
+									formsource="plugins/system/dogqnocaptcha/forms/ua_list.xml"
+									multiple="true"
+							/>
+
+							<field
+									name="xf3p"
+									type="text"
+									label="Access Token"
+									description="A private token that DogQ includes in the URL. Must match exactly."
+									required="false"
+							/>
+
+					</fieldset>
+			</fields>
     </config>
+
 </extension>
