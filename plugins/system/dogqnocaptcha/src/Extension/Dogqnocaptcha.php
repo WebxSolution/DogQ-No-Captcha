@@ -6,6 +6,7 @@ use Joomla\CMS\Plugin\CMSPlugin;
 use Joomla\CMS\Factory;
 use Joomla\CMS\Document\HtmlDocument as JDocumentHtml;
 use Joomla\Database\ParameterType;
+use Joomla\Registry\Registry;
 
 defined('_JEXEC') or die;
 
@@ -38,9 +39,9 @@ class Dogqnocaptcha extends CMSPlugin
         }
 
         $agent   = $app->input->server->getString('HTTP_USER_AGENT', '');
-        $checkUa = empty($patterns); // if no patterns, skip UA check
-
-        if (!$checkUa) {
+		$checkUa = false;
+		
+        if (!empty($patterns)) {
             foreach ($patterns as $pattern) {
                 if ($pattern && stripos($agent, $pattern) !== false) {
                     $checkUa = true;
@@ -49,14 +50,16 @@ class Dogqnocaptcha extends CMSPlugin
             }
         }
 
+
         // Apply final decision
         $this->checkUa = $checkUa;
-
+		
         // --- IMPORTANT ---
         // If UA is allowed AND token matches, we disable the RSFormPro Recaptcha field in DB.
         // This prevents RSFormPro from validating recaptcha on form submit.
         // We'll restore (republish) it in onAfterRender.
         $formId = $app->input->getInt('formId', 0);
+	
 
 		// Fallback: If RSForm is embedded in an article ({rsform X})
 		if ($formId == 0) {
@@ -138,21 +141,64 @@ class Dogqnocaptcha extends CMSPlugin
         $doc->setHeadData($headData);
     }
 
-	/**
-     * onRsformFrontendInitFormDisplay – remove template placeholders for recaptcha
-     */
-    public function onRsformFrontendInitFormDisplay($args)
-    {
-        if (!empty($args['formLayout']) && is_string($args['formLayout'])) {
-            $args['formLayout'] = preg_replace(
-                '/\{recp?aptcha:[^}]+}/i', //Have to account for recaptcha Typo in RSform plugin hence the [p?]
-                '',
-                $args['formLayout']
-            );
-        }
-    }
 
-   
+	public function onRsformFrontendInitFormDisplay($args)
+	{
+		if (empty($args['formLayout']) || !is_string($args['formLayout'])) {
+			return;
+		}
+
+		$html = $args['formLayout'];
+
+		$variants = ['captcha', 'capcha', 'cpaptcha'];
+
+		$dom = new \DOMDocument();
+		libxml_use_internal_errors(true);
+		$dom->loadHTML('<?xml encoding="utf-8" ?><div id="__wrapper">'.$html.'</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+		libxml_clear_errors();
+
+		$xpath = new \DOMXPath($dom);
+
+		// -------------------------------------------------
+		// 1. Remove all recaptcha divs (v2 or v3)
+		// -------------------------------------------------
+		foreach ($xpath->query('//*[contains(@class, "rsform-type-recaptcha")]') as $node) {
+			if ($node->parentNode) {
+				$node->parentNode->removeChild($node);
+			}
+		}
+
+		// -------------------------------------------------
+		// 3. Remove empty formControls divs
+		// -------------------------------------------------
+		foreach ($xpath->query('//div[contains(@class,"formControls")]') as $fcDiv) {
+			if (trim($fcDiv->textContent) === '' && $fcDiv->parentNode) {
+				$fcDiv->parentNode->removeChild($fcDiv);
+			}
+		}
+
+		// -------------------------------------------------
+		// 4. Extract inner HTML back
+		// -------------------------------------------------
+		$wrapper = $dom->getElementById('__wrapper');
+		$innerHtml = '';
+		if ($wrapper) {
+			foreach ($wrapper->childNodes as $child) {
+				$innerHtml .= $dom->saveHTML($child);
+			}
+		}
+		
+		
+		//Clear free text variants
+		foreach ($variants as $variant) {
+			$pattern = '/\{[^}]*' . preg_quote($variant, '/') . '[^}]*\}/i';
+			$innerHtml = preg_replace($pattern, '', $innerHtml);
+		}
+
+		$args['formLayout'] = $innerHtml;
+	}
+
+
     /**
      * Disable RSFormPro Recaptcha field for this form.
      */
@@ -253,22 +299,21 @@ class Dogqnocaptcha extends CMSPlugin
 	 */
 	protected function detectFormIdFromArticle(): int
 	{
-		$app = Factory::getApplication();
-		$option = $app->input->getCmd('option', '');
-		$view   = $app->input->getCmd('view', '');
-		$id     = $app->input->getInt('id', 0);
-
-		// We only handle com_content articles
-		if ($option !== 'com_content' || $view !== 'article' || $id <= 0) {
-			return 0;
-		}
-
 		try {
-			$db = Factory::getDbo();
+			$app   = Factory::getApplication();
+			$id    = $app->input->getInt('id', 0);
+
+			if ($id <= 0) {
+				return 0;
+			}
+
+			// --- Load article text ---
+			$db = Factory::getContainer()->get('DatabaseDriver');
 			$query = $db->getQuery(true)
 				->select($db->quoteName(['introtext','fulltext']))
 				->from($db->quoteName('#__content'))
 				->where($db->quoteName('id') . ' = :id');
+
 			$query->bind(':id', $id, ParameterType::INTEGER);
 
 			$article = $db->setQuery($query)->loadObject();
@@ -277,19 +322,56 @@ class Dogqnocaptcha extends CMSPlugin
 				return 0;
 			}
 
-			$text = $article->introtext . "\n" . $article->fulltext;
+			$content = ($article->introtext ?? '') . ($article->fulltext ?? '');
 
-			// Works for: {rsform 3} OR {rsform 12} etc.
-			if (preg_match('/\{rsform\s+(\d+)\}/i', $text, $m)) {
+			if ($content === '') {
+				return 0;
+			}
+
+			// ============================================================
+			// 1) METHOD A — RSForm shortcode {rsform X}
+			// ============================================================
+			if (preg_match('/\{rsform\s+(\d+)\}/i', $content, $m)) {
 				return (int) $m[1];
 			}
+
+			// ============================================================
+			// 2) METHOD B — Module position inside YOOtheme JSON
+			//     Extracts: "type":"module_position", "content":"builder-4"
+			// ============================================================
+			if (preg_match('/"type":"module_position".*?"content":"([^"]+)"/', $content, $matches)) {
+				$position = $matches[1];
+
+				// Load the module assigned to that position
+				$query = $db->getQuery(true)
+					->select('m.*')
+					->from($db->quoteName('#__modules', 'm'))
+					->where($db->quoteName('m.module') . ' = ' . $db->quote('mod_rsform'))
+					->where($db->quoteName('m.position') . ' = ' . $db->quote($position))
+					->where($db->quoteName('m.published') . ' = 1')
+					->setLimit(1);
+
+				$module = $db->setQuery($query)->loadObject();
+
+				if ($module && !empty($module->params)) {
+
+					// Use Joomla Registry — NOT json_decode
+					$registry = new Registry($module->params);
+					$formId   = (int) $registry->get('formId', 0);
+
+					return $formId;
+				}
+			}
+
+			// No form detected
+			return 0;
 		}
 		catch (\Throwable $e) {
-			// Silent fail
+			// Always return safe fallback
+			return 0;
 		}
-
-		return 0;
 	}
+
 	
 	/**
 	 * Returns an array of ComponentId values for components of a given type on a form.
@@ -325,12 +407,12 @@ class Dogqnocaptcha extends CMSPlugin
 				->where($db->quoteName('formId') . ' = :fid')
 				->where($db->quoteName('ComponentTypeId') . ' = :tid');
 
-			$query->bind(':fid', $formId, \Joomla\Database\ParameterType::INTEGER);
-			$query->bind(':tid', $typeId, \Joomla\Database\ParameterType::INTEGER);
+			$query->bind(':fid', $formId, ParameterType::INTEGER);
+			$query->bind(':tid', $typeId, ParameterType::INTEGER);
 
 			if ($published !== null) {
 				$query->where($db->quoteName('published') . ' = :pub');
-				$query->bind(':pub', $published, \Joomla\Database\ParameterType::INTEGER);
+				$query->bind(':pub', $published, ParameterType::INTEGER);
 			}
 
 			return $db->setQuery($query)->loadColumn() ?: [];

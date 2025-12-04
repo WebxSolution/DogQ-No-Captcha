@@ -2,8 +2,8 @@
 <extension type="plugin" group="system" method="upgrade" plugin="dogqnocaptcha" version="6.0">
 
     <name>System - DogQ No Captcha</name>
-    <version>1.2.0</version>
-    <creationDate>2025-11-24</creationDate>
+    <version>1.4.0</version>
+    <creationDate>2025-11-25</creationDate>
     <author>webx.solutions</author>
     <description>Bypass RSForm reCAPTCHA for DogQ testing scripts.</description>
 

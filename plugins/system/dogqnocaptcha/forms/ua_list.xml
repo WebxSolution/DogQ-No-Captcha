@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <form>
-    <fields name="ua">
-        <fieldset name="ua">
+       <fieldset name="ua">
             <field
                 name="useragent"
                 type="text"
@@ -10,5 +9,4 @@
                 required="true"
             />
         </fieldset>
-    </fields>
 </form>
